@@ -1,0 +1,404 @@
+import { Ionicons } from "@expo/vector-icons";
+import * as SQLite from "expo-sqlite";
+import { StatusBar } from "expo-status-bar";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+
+type Subject = { id: number; name: string; color: string };
+type Task = {
+  id: number;
+  title: string;
+  subject_id: number | null;
+  subject_name?: string | null;
+  completed: number;
+  priority: "Low" | "Medium" | "High";
+  due_at: string | null;
+};
+type Session = {
+  id: number;
+  subject_id: number | null;
+  subject_name?: string | null;
+  duration_seconds: number;
+  started_at: string;
+  date_key: string;
+};
+type Tab = "Home" | "Timer" | "Todo" | "Subjects" | "Settings";
+type ModalType = "task" | "subject" | null;
+
+const C = {
+  background: "#F6F7FB",
+  card: "#FFFFFF",
+  text: "#172033",
+  muted: "#8991A5",
+  primary: "#635BFF",
+  purpleLight: "#EEEDFF",
+  green: "#18A878",
+  greenLight: "#E3F8EF",
+  border: "#ECEEF4",
+};
+const SUBJECT_COLORS = ["#635BFF", "#18A878", "#FF9D42", "#E45B9A", "#3198DB", "#9270D8"];
+const pad = (n: number) => String(n).padStart(2, "0");
+const dateKey = (date = new Date()) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+function formatTime(seconds: number) {
+  const safe = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = safe % 60;
+  return h ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+function formatHours(seconds: number) {
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  const hours = seconds / 3600;
+  return `${hours.toFixed(hours < 10 ? 1 : 0)}h`;
+}
+function startOfWeek(date: Date) {
+  const d = new Date(date);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+export default function TaskoraScreen() {
+  const insets = useSafeAreaInsets();
+  const dbRef = useRef<SQLite.SQLiteDatabase | null>(null);
+  const timerStartRef = useRef<number | null>(null);
+  const baseElapsedRef = useRef(0);
+  const sessionStartedAtRef = useRef<string | null>(null);
+  const savedSessionRef = useRef(false);
+
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState<Tab>("Home");
+  const [subjects, setSubjects] = useState<Subject[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [selectedSubject, setSelectedSubject] = useState<number | null>(null);
+  const [durationMinutes, setDurationMinutes] = useState(25);
+  const [customMinutes, setCustomMinutes] = useState("45");
+  const [elapsed, setElapsed] = useState(0);
+  const [running, setRunning] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [timerSubject, setTimerSubject] = useState<number | null>(null);
+  const [modal, setModal] = useState<ModalType>(null);
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskPriority, setTaskPriority] = useState<"Low" | "Medium" | "High">("Medium");
+  const [taskSubject, setTaskSubject] = useState<number | null>(null);
+  const [taskTime, setTaskTime] = useState("");
+  const [subjectName, setSubjectName] = useState("");
+  const [subjectColor, setSubjectColor] = useState(SUBJECT_COLORS[0]);
+  const [darkMode, setDarkMode] = useState(false);
+  const [weekOffset, setWeekOffset] = useState(0);
+
+  const theme = darkMode
+    ? { ...C, background: "#111522", card: "#1C2232", text: "#F4F5FC", muted: "#A0A8BC", border: "#30374A", purpleLight: "#302D53", greenLight: "#173B32" }
+    : C;
+  const bg = theme.background;
+  const card = theme.card;
+  const text = theme.text;
+  const muted = theme.muted;
+
+  const loadData = useCallback(async () => {
+    const db = dbRef.current;
+    if (!db) return;
+    const [loadedSubjects, loadedTasks, loadedSessions] = await Promise.all([
+      db.getAllAsync<Subject>("SELECT id, name, color FROM subjects ORDER BY id DESC"),
+      db.getAllAsync<Task>(`SELECT tasks.*, subjects.name AS subject_name FROM tasks LEFT JOIN subjects ON tasks.subject_id = subjects.id ORDER BY tasks.completed ASC, tasks.id DESC`),
+      db.getAllAsync<Session>(`SELECT study_sessions.*, subjects.name AS subject_name FROM study_sessions LEFT JOIN subjects ON study_sessions.subject_id = subjects.id ORDER BY study_sessions.id DESC`),
+    ]);
+    setSubjects(loadedSubjects);
+    setTasks(loadedTasks);
+    setSessions(loadedSessions);
+    setSelectedSubject((current) => current !== null && loadedSubjects.some((s) => s.id === current) ? current : loadedSubjects[0]?.id ?? null);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const db = await SQLite.openDatabaseAsync("taskora.db");
+        dbRef.current = db;
+        await db.execAsync(`
+          PRAGMA journal_mode = WAL;
+          CREATE TABLE IF NOT EXISTS subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, color TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, subject_id INTEGER, completed INTEGER NOT NULL DEFAULT 0, priority TEXT NOT NULL DEFAULT 'Medium', reminder_id TEXT, due_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+          CREATE TABLE IF NOT EXISTS study_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER, duration_seconds INTEGER NOT NULL, started_at TEXT NOT NULL, date_key TEXT NOT NULL);
+        `);
+        const count = await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) AS count FROM subjects");
+        if (!count || count.count === 0) {
+          for (const [name, color] of [["Physics", "#635BFF"], ["Chemistry", "#18A878"], ["Higher Math", "#FF9D42"], ["Biology", "#E45B9A"]]) {
+            await db.runAsync("INSERT OR IGNORE INTO subjects (name, color) VALUES (?, ?)", name, color);
+          }
+        }
+        if (mounted) {
+          await loadData();
+          setReady(true);
+        }
+      } catch (error) {
+        console.error("Taskora database initialization failed:", error);
+        if (mounted) Alert.alert("Database error", "Taskora could not load your local data. Please restart the app and try again.");
+      }
+    })();
+    return () => { mounted = false; };
+  }, [loadData]);
+
+  async function saveSession(seconds: number) {
+    const db = dbRef.current;
+    if (!db || seconds < 1) return;
+    try {
+      const startedAt = sessionStartedAtRef.current ?? new Date().toISOString();
+      const startedDate = new Date(startedAt);
+      await db.runAsync(
+        "INSERT INTO study_sessions (subject_id, duration_seconds, started_at, date_key) VALUES (?, ?, ?, ?)",
+        timerSubject, Math.floor(seconds), startedAt, dateKey(startedDate)
+      );
+      await loadData();
+    } catch (error) {
+      console.error("Could not save study session:", error);
+      Alert.alert("Save failed", "Your study session could not be saved.");
+    }
+  }
+
+  useEffect(() => {
+    if (!running || timerStartRef.current === null) return;
+    const startedAt = timerStartRef.current;
+    const baseElapsed = baseElapsedRef.current;
+    const targetSeconds = durationMinutes * 60;
+    const updateTimer = () => {
+      const total = Math.min(targetSeconds, baseElapsed + Math.floor((Date.now() - startedAt) / 1000));
+      setElapsed(total);
+      if (total >= targetSeconds) {
+        timerStartRef.current = null;
+        baseElapsedRef.current = total;
+        setRunning(false);
+        setPaused(false);
+        if (!savedSessionRef.current) {
+          savedSessionRef.current = true;
+          void saveSession(total);
+          Alert.alert("Session complete!", "Great work! Your focus session has been saved.");
+        }
+      }
+    };
+    updateTimer();
+    const interval = setInterval(updateTimer, 500);
+    return () => clearInterval(interval);
+  }, [running, durationMinutes]);
+
+  function startTimer() {
+    if (subjects.length === 0) {
+      Alert.alert("No subjects", "Add a study subject before starting a timer.");
+      return;
+    }
+    if (!paused && elapsed === 0) {
+      savedSessionRef.current = false;
+      baseElapsedRef.current = 0;
+      sessionStartedAtRef.current = new Date().toISOString();
+      setTimerSubject(selectedSubject);
+    } else {
+      baseElapsedRef.current = elapsed;
+    }
+    timerStartRef.current = Date.now();
+    setRunning(true);
+    setPaused(false);
+    setTab("Timer");
+  }
+
+  function pauseTimer() {
+    if (timerStartRef.current !== null) {
+      const total = Math.min(durationMinutes * 60, baseElapsedRef.current + Math.floor((Date.now() - timerStartRef.current) / 1000));
+      baseElapsedRef.current = total;
+      setElapsed(total);
+    }
+    timerStartRef.current = null;
+    setRunning(false);
+    setPaused(true);
+  }
+
+  async function finishTimer() {
+    let total = elapsed;
+    if (running && timerStartRef.current !== null) total = Math.min(durationMinutes * 60, baseElapsedRef.current + Math.floor((Date.now() - timerStartRef.current) / 1000));
+    timerStartRef.current = null;
+    baseElapsedRef.current = 0;
+    setRunning(false);
+    setPaused(false);
+    setElapsed(0);
+    if (total > 0 && !savedSessionRef.current) {
+      savedSessionRef.current = true;
+      await saveSession(total);
+    }
+    sessionStartedAtRef.current = null;
+  }
+
+  function resetTimer() {
+    timerStartRef.current = null;
+    baseElapsedRef.current = 0;
+    sessionStartedAtRef.current = null;
+    setRunning(false);
+    setPaused(false);
+    setElapsed(0);
+    savedSessionRef.current = false;
+  }
+
+  function openTaskModal() {
+    setTaskTitle(""); setTaskSubject(selectedSubject); setTaskTime(""); setTaskPriority("Medium"); setModal("task");
+  }
+
+  async function addTask() {
+    const title = taskTitle.trim();
+    const db = dbRef.current;
+    if (!title || !db) { Alert.alert("Task title", "Enter a title for your task."); return; }
+    let dueAt: Date | null = null;
+    if (taskTime.trim()) {
+      const match = taskTime.trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+      if (!match) { Alert.alert("Invalid time", "Use 24-hour HH:MM format, for example 18:30."); return; }
+      dueAt = new Date(); dueAt.setHours(Number(match[1]), Number(match[2]), 0, 0);
+      if (dueAt.getTime() <= Date.now()) { Alert.alert("Invalid time", "Enter a time later today."); return; }
+    }
+    try {
+      await db.runAsync("INSERT INTO tasks (title, subject_id, completed, priority, reminder_id, due_at) VALUES (?, ?, 0, ?, NULL, ?)", title, taskSubject, taskPriority, dueAt?.toISOString() ?? null);
+      setTaskTitle(""); setTaskTime(""); setTaskPriority("Medium"); setModal(null);
+      await loadData();
+    } catch (error) {
+      console.error("Could not create task:", error);
+      Alert.alert("Could not create task", "Please try again.");
+    }
+  }
+
+  async function toggleTask(task: Task) {
+    const db = dbRef.current; if (!db) return;
+    try { await db.runAsync("UPDATE tasks SET completed = ? WHERE id = ?", task.completed ? 0 : 1, task.id); await loadData(); }
+    catch { Alert.alert("Update failed", "The task could not be updated."); }
+  }
+
+  async function deleteTask(task: Task) {
+    const db = dbRef.current; if (!db) return;
+    try { await db.runAsync("DELETE FROM tasks WHERE id = ?", task.id); await loadData(); }
+    catch { Alert.alert("Delete failed", "The task could not be deleted."); }
+  }
+
+  async function addSubject() {
+    const name = subjectName.trim(); const db = dbRef.current;
+    if (!name || !db) { Alert.alert("Subject name", "Enter a subject name."); return; }
+    try {
+      await db.runAsync("INSERT INTO subjects (name, color) VALUES (?, ?)", name, subjectColor);
+      setSubjectName(""); setModal(null); await loadData();
+    } catch { Alert.alert("Subject already exists", "A subject with this name already exists."); }
+  }
+
+  function deleteSubject(subject: Subject) {
+    const db = dbRef.current; if (!db) return;
+    Alert.alert("Delete subject?", `Delete ${subject.name}? Existing tasks and sessions will remain, but will no longer be linked to this subject.`, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Delete", style: "destructive", onPress: async () => {
+        await db.runAsync("UPDATE tasks SET subject_id = NULL WHERE subject_id = ?", subject.id);
+        await db.runAsync("UPDATE study_sessions SET subject_id = NULL WHERE subject_id = ?", subject.id);
+        await db.runAsync("DELETE FROM subjects WHERE id = ?", subject.id);
+        if (selectedSubject === subject.id) setSelectedSubject(null);
+        await loadData();
+      } },
+    ]);
+  }
+
+  const todaySessions = sessions.filter((s) => s.date_key === dateKey());
+  const todaySeconds = todaySessions.reduce((sum, s) => sum + s.duration_seconds, 0);
+  const openTasks = tasks.filter((t) => !t.completed);
+  const completedTasks = tasks.filter((t) => t.completed).length;
+  const weekStart = startOfWeek(new Date());
+  weekStart.setDate(weekStart.getDate() + weekOffset * 7);
+  const weeklyData = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(weekStart); day.setDate(day.getDate() + index); const key = dateKey(day);
+    return { key, label: day.toLocaleDateString("en-US", { weekday: "short" }), seconds: sessions.filter((s) => s.date_key === key).reduce((sum, s) => sum + s.duration_seconds, 0), isToday: key === dateKey() };
+  });
+  const weeklyTotal = weeklyData.reduce((sum, d) => sum + d.seconds, 0);
+  const maxBar = Math.max(...weeklyData.map((d) => d.seconds), 3600);
+  const subjectStats = subjects.map((subject) => ({ ...subject, seconds: sessions.filter((s) => s.subject_id === subject.id).reduce((sum, s) => sum + s.duration_seconds, 0) }));
+  const timerProgress = Math.min(1, elapsed / Math.max(1, durationMinutes * 60));
+
+  function SectionTitle({ title, action, onAction }: { title: string; action?: string; onAction?: () => void }) {
+    return <View style={styles.sectionTitle}><Text style={[styles.sectionHeading, { color: text }]}>{title}</Text>{action ? <Pressable onPress={onAction}><Text style={styles.actionText}>{action}</Text></Pressable> : null}</View>;
+  }
+  function Card({ children, style }: { children: React.ReactNode; style?: object }) {
+    return <View style={[styles.card, { backgroundColor: card, borderColor: theme.border }, style]}>{children}</View>;
+  }
+  function EmptyState({ title, subtitle, icon }: { title: string; subtitle: string; icon: React.ComponentProps<typeof Ionicons>["name"] }) {
+    return <View style={styles.emptyState}><View style={styles.emptyIcon}><Ionicons name={icon} size={25} color={C.primary} /></View><Text style={[styles.emptyTitle, { color: text }]}>{title}</Text><Text style={[styles.emptySubtitle, { color: muted }]}>{subtitle}</Text></View>;
+  }
+  function renderTask(task: Task) {
+    const subject = subjects.find((s) => s.id === task.subject_id);
+    return <View key={task.id} style={[styles.taskRow, { borderBottomColor: theme.border }]}>
+      <Pressable onPress={() => toggleTask(task)} style={[styles.checkCircle, !!task.completed && styles.checkedCircle]}>{task.completed ? <Ionicons name="checkmark" size={15} color="#fff" /> : null}</Pressable>
+      <View style={styles.taskTextWrap}><Text style={[styles.taskTitle, { color: text }, !!task.completed && styles.completedText]}>{task.title}</Text><View style={styles.taskMeta}><View style={[styles.miniDot, { backgroundColor: subject?.color ?? muted }]} /><Text style={[styles.smallText, { color: muted }]}>{subject?.name ?? "General"}</Text>{task.due_at ? <Text style={[styles.smallText, { color: muted }]}> · {new Date(task.due_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</Text> : null}</View></View>
+      <View style={[styles.priorityBadge, { backgroundColor: task.priority === "High" ? "#FDE9E9" : task.priority === "Low" ? "#E5F7EF" : "#FFF1DF" }]}><Text style={{ color: task.priority === "High" ? "#D94A4A" : task.priority === "Low" ? "#14845E" : "#B97925", fontSize: 10, fontWeight: "700" }}>{task.priority}</Text></View>
+      <Pressable onPress={() => Alert.alert("Delete task?", task.title, [{ text: "Cancel", style: "cancel" }, { text: "Delete", style: "destructive", onPress: () => deleteTask(task) }])} style={styles.deleteButton}><Ionicons name="trash-outline" size={17} color={muted} /></Pressable>
+    </View>;
+  }
+
+  function renderHome() {
+    return <>
+      <View style={styles.greetingRow}><View><Text style={[styles.eyebrow, { color: muted }]}>YOUR STUDY SPACE</Text><Text style={[styles.pageTitle, { color: text }]}>Let's focus! 👋</Text><Text style={[styles.subtitle, { color: muted }]}>Small steps. Big results.</Text></View><View style={styles.avatar}><Ionicons name="school" size={24} color={C.primary} /></View></View>
+      <Card style={styles.heroCard}><View style={styles.heroTop}><View style={{ flex: 1 }}><Text style={styles.heroEyebrow}>TODAY'S STUDY TIME</Text><Text style={styles.heroNumber}>{formatHours(todaySeconds)}</Text><Text style={styles.heroSub}>Based on your completed timer sessions</Text></View><View style={styles.heroIcon}><Ionicons name="time-outline" size={27} color="#fff" /></View></View><View style={styles.heroDivider} /><View style={styles.heroBottom}><View><Text style={styles.heroStatLabel}>Tasks remaining</Text><Text style={styles.heroStatValue}>{openTasks.length}</Text></View><View><Text style={styles.heroStatLabel}>Tasks completed</Text><Text style={styles.heroStatValue}>{completedTasks}</Text></View><Pressable style={styles.heroButton} onPress={() => setTab("Timer")}><Ionicons name="play" size={15} color={C.primary} /><Text style={styles.heroButtonText}>Study now</Text></Pressable></View></Card>
+      <SectionTitle title="Quick overview" action="View planner" onAction={() => setTab("Todo")} /><View style={styles.statsRow}><Card style={styles.statCard}><View style={[styles.statIcon, { backgroundColor: "#EEEDFF" }]}><Ionicons name="timer-outline" size={20} color={C.primary} /></View><Text style={[styles.statValue, { color: text }]}>{todaySessions.length}</Text><Text style={[styles.statLabel, { color: muted }]}>Study sessions</Text></Card><Card style={styles.statCard}><View style={[styles.statIcon, { backgroundColor: "#E3F8EF" }]}><Ionicons name="checkmark-done" size={20} color={C.green} /></View><Text style={[styles.statValue, { color: text }]}>{completedTasks}</Text><Text style={[styles.statLabel, { color: muted }]}>Completed tasks</Text></Card></View>
+      <SectionTitle title="Study activity" action="See timer" onAction={() => setTab("Timer")} /><Card><View style={styles.chartHeader}><View><Text style={[styles.chartTotal, { color: text }]}>{formatHours(weeklyTotal)}</Text><Text style={[styles.smallText, { color: muted }]}>Total study time this week</Text></View><View style={styles.weekControls}><Pressable onPress={() => setWeekOffset((v) => v - 1)} style={styles.weekArrow}><Ionicons name="chevron-back" size={16} color={text} /></Pressable><Pressable onPress={() => setWeekOffset((v) => Math.min(0, v + 1))} disabled={weekOffset === 0} style={[styles.weekArrow, weekOffset === 0 && { opacity: 0.3 }]}><Ionicons name="chevron-forward" size={16} color={text} /></Pressable></View></View><View style={styles.chart}>{weeklyData.map((day) => <View key={day.key} style={styles.chartColumn}><Text style={[styles.chartValue, { color: day.isToday ? C.primary : muted }]}>{day.seconds ? day.seconds >= 3600 ? `${(day.seconds / 3600).toFixed(1)}h` : `${Math.round(day.seconds / 60)}m` : "—"}</Text><View style={styles.barTrack}><View style={[styles.chartBar, { height: Math.max(day.seconds > 0 ? 5 : 3, (day.seconds / maxBar) * 112), backgroundColor: day.isToday ? C.primary : "#C7C3FF" }]} /></View><Text style={[styles.chartLabel, { color: day.isToday ? C.primary : muted, fontWeight: day.isToday ? "800" : "500" }]}>{day.label}</Text></View>)}</View><Text style={[styles.chartFootnote, { color: muted }]}>The graph updates when you save a study session.</Text></Card>
+      <SectionTitle title="Upcoming tasks" action="+ Add task" onAction={openTaskModal} /><Card>{openTasks.length ? openTasks.slice(0, 4).map(renderTask) : <EmptyState title="You're all caught up!" subtitle="Add a task to plan your next study session." icon="checkbox-outline" />}</Card>
+      <SectionTitle title="Your subjects" action="Manage" onAction={() => setTab("Subjects")} /><View style={styles.subjectGrid}>{subjectStats.slice(0, 4).map((s) => <Pressable key={s.id} onPress={() => { setSelectedSubject(s.id); setTab("Timer"); }} style={[styles.subjectTile, { backgroundColor: card, borderColor: theme.border }]}><View style={[styles.subjectColorBar, { backgroundColor: s.color }]} /><Text style={[styles.subjectTileName, { color: text }]}>{s.name}</Text><Text style={[styles.smallText, { color: muted }]}>{formatHours(s.seconds)} studied</Text></Pressable>)}</View>
+    </>;
+  }
+
+  function renderTimer() {
+    const remaining = Math.max(0, durationMinutes * 60 - elapsed);
+    return <><Text style={[styles.eyebrow, { color: muted }]}>STAY FOCUSED</Text><Text style={[styles.pageTitle, { color: text }]}>Study timer</Text><Text style={[styles.subtitle, { color: muted }]}>Focus on one thing at a time.</Text>
+      <Card style={styles.timerCard}><View style={styles.timerBadge}><Ionicons name="headset-outline" size={16} color={C.primary} /><Text style={styles.timerBadgeText}>{running ? "SESSION IN PROGRESS" : "FOCUS SESSION"}</Text></View><View style={styles.timerCircleOuter}><View style={[styles.timerProgress, { borderColor: C.primary, opacity: timerProgress > 0 ? 1 : 0.22 }]} /><View style={styles.timerCircleInner}><Text style={[styles.timerTime, { color: text }]}>{formatTime(remaining)}</Text><Text style={[styles.timerStatus, { color: muted }]}>{running ? "Keep going!" : paused ? "Paused" : "Ready to focus"}</Text></View></View>
+      <Text style={[styles.timerLabel, { color: muted }]}>STUDY SUBJECT</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipScroll}>{subjects.map((s) => <Pressable key={s.id} onPress={() => { if (running || elapsed > 0) { Alert.alert("Timer active", "Finish or reset the current session before changing subjects."); return; } setSelectedSubject(s.id); }} style={[styles.subjectChip, { backgroundColor: selectedSubject === s.id ? s.color : theme.background, borderColor: selectedSubject === s.id ? s.color : theme.border }]}><Text style={{ color: selectedSubject === s.id ? "#fff" : text, fontSize: 12, fontWeight: "700" }}>{s.name}</Text></Pressable>)}</ScrollView>
+      <Text style={[styles.timerLabel, { color: muted }]}>SESSION LENGTH</Text><View style={styles.durationRow}>{[25, 45, 60].map((minutes) => <Pressable key={minutes} disabled={running || elapsed > 0} onPress={() => { setDurationMinutes(minutes); setCustomMinutes(String(minutes)); }} style={[styles.durationChip, { backgroundColor: durationMinutes === minutes ? C.primary : theme.background, borderColor: durationMinutes === minutes ? C.primary : theme.border, opacity: running || elapsed > 0 ? 0.5 : 1 }]}><Text style={{ color: durationMinutes === minutes ? "#fff" : text, fontWeight: "800" }}>{minutes} min</Text></Pressable>)}</View>
+      <View style={styles.customDurationRow}><TextInput value={customMinutes} onChangeText={setCustomMinutes} editable={!running && elapsed === 0} keyboardType="number-pad" placeholder="Custom minutes" placeholderTextColor={muted} style={[styles.customDurationInput, { color: text, backgroundColor: theme.background, borderColor: theme.border }]} /><Pressable disabled={running || elapsed > 0} onPress={() => { const value = Number(customMinutes); if (!Number.isInteger(value) || value < 1 || value > 240) { Alert.alert("Invalid duration", "Choose a duration between 1 and 240 minutes."); return; } setDurationMinutes(value); }} style={[styles.applyButton, (running || elapsed > 0) && { opacity: 0.5 }]}><Text style={styles.applyButtonText}>Apply</Text></Pressable></View>
+      <View style={styles.timerActions}>{!running ? <Pressable onPress={startTimer} style={styles.startButton}><Ionicons name="play" size={20} color="#fff" /><Text style={styles.startButtonText}>{paused ? "Resume session" : elapsed > 0 ? "Resume" : "Start studying"}</Text></Pressable> : <Pressable onPress={pauseTimer} style={[styles.startButton, { backgroundColor: "#F09B42" }]}><Ionicons name="pause" size={20} color="#fff" /><Text style={styles.startButtonText}>Pause session</Text></Pressable>}<Pressable onPress={() => { if (elapsed > 0 || running) Alert.alert("Finish session?", "Save your elapsed study time?", [{ text: "Cancel", style: "cancel" }, { text: "Save & finish", onPress: () => { void finishTimer(); } }]); else resetTimer(); }} style={[styles.resetButton, { backgroundColor: theme.background }]}><Ionicons name="stop" size={19} color={text} /></Pressable></View><Text style={[styles.timerNote, { color: muted }]}>Your study history is saved locally on this device.</Text></Card>
+      <SectionTitle title="Today's sessions" /><Card>{todaySessions.length ? todaySessions.map((s) => <View key={s.id} style={[styles.sessionRow, { borderBottomColor: theme.border }]}><View style={[styles.sessionIcon, { backgroundColor: theme.purpleLight }]}><Ionicons name="book-outline" size={19} color={C.primary} /></View><View style={{ flex: 1 }}><Text style={[styles.taskTitle, { color: text }]}>{s.subject_name ?? "General study"}</Text><Text style={[styles.smallText, { color: muted }]}>{new Date(s.started_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</Text></View><Text style={[styles.sessionDuration, { color: text }]}>{formatTime(s.duration_seconds)}</Text></View>) : <EmptyState title="No sessions yet" subtitle="Start your first timer to build your study history." icon="hourglass-outline" />}</Card>
+    </>;
+  }
+
+  function renderPlanner() {
+    return <><Text style={[styles.eyebrow, { color: muted }]}>GET THINGS DONE</Text><Text style={[styles.pageTitle, { color: text }]}>My To-do</Text><Text style={[styles.subtitle, { color: muted }]}>Your tasks, your pace.</Text><Card style={styles.plannerSummary}><View style={{ flex: 1 }}><Text style={styles.plannerSummaryTitle}>Your progress</Text><Text style={styles.plannerSummarySubtitle}>{completedTasks} completed · {openTasks.length} remaining</Text></View><View style={styles.plannerProgressCircle}><Text style={styles.plannerProgressText}>{tasks.length ? Math.round((completedTasks / tasks.length) * 100) : 0}%</Text></View></Card><SectionTitle title="All tasks" action="+ New task" onAction={openTaskModal} /><Card>{tasks.length ? tasks.map(renderTask) : <EmptyState title="No tasks yet" subtitle="Create your first task to get started." icon="calendar-outline" />}</Card><SectionTitle title="Study statistics" /><Card>{[["Total recorded study time", formatHours(sessions.reduce((sum, s) => sum + s.duration_seconds, 0))], ["Total study sessions", String(sessions.length)], ["Subjects", String(subjects.length)]].map(([label, value]) => <View key={label} style={[styles.statLine, { borderBottomColor: theme.border }]}><Text style={[styles.statLineLabel, { color: muted }]}>{label}</Text><Text style={[styles.statLineValue, { color: text }]}>{value}</Text></View>)}</Card></>;
+  }
+
+  function renderSubjects() {
+    return <><Text style={[styles.eyebrow, { color: muted }]}>YOUR LEARNING</Text><Text style={[styles.pageTitle, { color: text }]}>Study subjects</Text><Text style={[styles.subtitle, { color: muted }]}>Add subjects and track real study time.</Text><Pressable onPress={() => { setSubjectName(""); setSubjectColor(SUBJECT_COLORS[0]); setModal("subject"); }} style={styles.addSubjectButton}><Ionicons name="add-circle-outline" size={21} color="#fff" /><Text style={styles.addSubjectText}>Add a subject</Text></Pressable>{subjectStats.map((s) => <Card key={s.id} style={styles.subjectCard}><View style={styles.subjectCardTop}><View style={[styles.subjectLargeIcon, { backgroundColor: `${s.color}20` }]}><Ionicons name="book" size={23} color={s.color} /></View><View style={{ flex: 1 }}><Text style={[styles.subjectCardName, { color: text }]}>{s.name}</Text><Text style={[styles.smallText, { color: muted }]}>{formatHours(s.seconds)} total study time</Text></View><Pressable onPress={() => deleteSubject(s)} style={styles.deleteButton}><Ionicons name="trash-outline" size={18} color={muted} /></Pressable></View><View style={[styles.subjectProgressTrack, { backgroundColor: theme.background }]}><View style={[styles.subjectProgressFill, { backgroundColor: s.color, width: `${Math.min(100, (s.seconds / 3600) * 100)}%` }]} /></View><View style={styles.subjectCardBottom}><Text style={[styles.smallText, { color: muted }]}>{s.seconds >= 3600 ? `${(s.seconds / 3600).toFixed(1)} hours recorded` : `${Math.round(s.seconds / 60)} minutes recorded`}</Text><Pressable onPress={() => { setSelectedSubject(s.id); resetTimer(); setTab("Timer"); }}><Text style={styles.actionText}>Study this →</Text></Pressable></View></Card>)}{subjects.length === 0 ? <Card><EmptyState title="No subjects" subtitle="Add your first subject." icon="library-outline" /></Card> : null}</>;
+  }
+
+  function renderSettings() {
+    return <><Text style={[styles.eyebrow, { color: muted }]}>MAKE IT YOURS</Text><Text style={[styles.pageTitle, { color: text }]}>Settings</Text><Text style={[styles.subtitle, { color: muted }]}>Customize your study experience.</Text><Card style={styles.profileCard}><View style={styles.profileIcon}><Ionicons name="school" size={28} color="#fff" /></View><View style={{ flex: 1 }}><Text style={[styles.profileName, { color: text }]}>Taskora</Text><Text style={[styles.smallText, { color: muted }]}>Study smarter, every day.</Text></View><View style={styles.versionBadge}><Text style={styles.versionText}>v1.0</Text></View></Card><Text style={[styles.settingsHeading, { color: muted }]}>PREFERENCES</Text><Card><View style={styles.settingRow}><View style={[styles.settingIcon, { backgroundColor: "#EEEDFF" }]}><Ionicons name="moon-outline" size={19} color={C.primary} /></View><View style={{ flex: 1 }}><Text style={[styles.settingTitle, { color: text }]}>Dark mode</Text><Text style={[styles.smallText, { color: muted }]}>A darker study environment</Text></View><Switch value={darkMode} onValueChange={setDarkMode} trackColor={{ true: C.primary }} /></View><View style={[styles.settingRow, { borderTopWidth: 1, borderTopColor: theme.border }]}><View style={[styles.settingIcon, { backgroundColor: "#E3F8EF" }]}><Ionicons name="notifications-outline" size={19} color={C.green} /></View><View style={{ flex: 1 }}><Text style={[styles.settingTitle, { color: text }]}>Task reminders</Text><Text style={[styles.smallText, { color: muted }]}>Local notifications are not supported by Expo Go in this setup.</Text></View><Switch value={false} disabled trackColor={{ true: C.primary }} /></View></Card><Text style={[styles.settingsHeading, { color: muted }]}>DATA & PRIVACY</Text><Card><View style={styles.settingRow}><View style={[styles.settingIcon, { backgroundColor: "#FFF1DF" }]}><Ionicons name="server-outline" size={19} color="#D58A2C" /></View><View style={{ flex: 1 }}><Text style={[styles.settingTitle, { color: text }]}>Local database</Text><Text style={[styles.smallText, { color: muted }]}>Your study records are stored on this device.</Text></View><Ionicons name="checkmark-circle" size={22} color={C.green} /></View><Pressable style={[styles.settingRow, { borderTopWidth: 1, borderTopColor: theme.border }]} onPress={() => Alert.alert("About Taskora", "Taskora helps you manage tasks, track study time, and build consistent habits. Your records are stored locally on this device.")}><View style={[styles.settingIcon, { backgroundColor: "#E6F2FF" }]}><Ionicons name="information-circle-outline" size={19} color="#3198DB" /></View><View style={{ flex: 1 }}><Text style={[styles.settingTitle, { color: text }]}>About Taskora</Text><Text style={[styles.smallText, { color: muted }]}>App information</Text></View><Ionicons name="chevron-forward" size={18} color={muted} /></Pressable></Card></>;
+  }
+
+  if (!ready) return <SafeAreaView style={[styles.loadingScreen, { backgroundColor: bg }]}><StatusBar style={darkMode ? "light" : "dark"} /><ActivityIndicator size="large" color={C.primary} /><Text style={[styles.loadingText, { color: text }]}>Preparing your study space...</Text></SafeAreaView>;
+
+  return <SafeAreaView style={[styles.safeArea, { backgroundColor: bg }]} edges={["top", "left", "right"]}><StatusBar style={darkMode ? "light" : "dark"} /><View style={{ flex: 1 }}><ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.pageContent, { paddingBottom: 125 + Math.max(insets.bottom, 8) }]}><View style={styles.brandHeader}><View style={styles.brandMark}><Ionicons name="checkmark-done" size={21} color="#FFFFFF" /></View><View style={{ flex: 1 }}><Text style={[styles.brandName, { color: text }]}>Taskora</Text><Text style={[styles.brandTagline, { color: muted }]}>Plan your day. Focus on your goals.</Text></View><Pressable onPress={() => setTab("Settings")} style={[styles.brandAction, { backgroundColor: theme.purpleLight }]}><Ionicons name="settings-outline" size={19} color={C.primary} /></Pressable></View>{tab === "Home" && renderHome()}{tab === "Timer" && renderTimer()}{tab === "Todo" && renderPlanner()}{tab === "Subjects" && renderSubjects()}{tab === "Settings" && renderSettings()}</ScrollView><View style={[styles.bottomNavPosition, { bottom: Math.max(insets.bottom, 8) + 8 }]}><View style={[styles.bottomNav, { backgroundColor: card, borderColor: theme.border }]}>{([["Home", "home-outline"], ["Todo", "checkbox-outline"], ["Timer", "timer-outline"], ["Subjects", "book-outline"], ["Settings", "settings-outline"]] as const).map(([name, icon]) => { const active = tab === name; return <Pressable key={name} onPress={() => setTab(name)} style={styles.navItem}><View style={[styles.navIconWrap, active && { backgroundColor: theme.purpleLight }]}><Ionicons name={icon} size={21} color={active ? C.primary : muted} /></View><Text style={[styles.navLabel, { color: active ? C.primary : muted }, active && { fontWeight: "800" }]}>{name}</Text></Pressable>; })}</View></View></View>
+    <Modal visible={modal !== null} transparent animationType="slide" onRequestClose={() => setModal(null)}><KeyboardAvoidingView style={styles.modalOverlay} behavior={Platform.OS === "ios" ? "padding" : undefined}><Pressable style={styles.modalBackdrop} onPress={() => setModal(null)} /><View style={[styles.modalSheet, { backgroundColor: card, paddingBottom: Math.max(insets.bottom, 20) }]}><View style={styles.modalHandle} /><View style={styles.modalTitleRow}><Text style={[styles.modalTitle, { color: text }]}>{modal === "task" ? "Create a task" : "Add a subject"}</Text><Pressable onPress={() => setModal(null)}><Ionicons name="close" size={24} color={muted} /></Pressable></View>
+      {modal === "task" ? <ScrollView keyboardShouldPersistTaps="handled"><Text style={[styles.inputLabel, { color: text }]}>TASK TITLE</Text><TextInput value={taskTitle} onChangeText={setTaskTitle} placeholder="e.g. Revise Static Electricity" placeholderTextColor={muted} style={[styles.modalInput, { color: text, backgroundColor: theme.background, borderColor: theme.border }]} /><Text style={[styles.inputLabel, { color: text }]}>SUBJECT</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}><Pressable onPress={() => setTaskSubject(null)} style={[styles.subjectChip, { backgroundColor: taskSubject === null ? C.primary : theme.background, borderColor: taskSubject === null ? C.primary : theme.border }]}><Text style={{ color: taskSubject === null ? "#fff" : text, fontWeight: "700" }}>General</Text></Pressable>{subjects.map((s) => <Pressable key={s.id} onPress={() => setTaskSubject(s.id)} style={[styles.subjectChip, { backgroundColor: taskSubject === s.id ? s.color : theme.background, borderColor: taskSubject === s.id ? s.color : theme.border }]}><Text style={{ color: taskSubject === s.id ? "#fff" : text, fontWeight: "700" }}>{s.name}</Text></Pressable>)}</ScrollView><Text style={[styles.inputLabel, { color: text }]}>PRIORITY</Text><View style={styles.priorityOptions}>{(["Low", "Medium", "High"] as const).map((p) => <Pressable key={p} onPress={() => setTaskPriority(p)} style={[styles.priorityOption, { backgroundColor: taskPriority === p ? C.primary : theme.background, borderColor: taskPriority === p ? C.primary : theme.border }]}><Text style={{ color: taskPriority === p ? "#fff" : text, fontWeight: "700" }}>{p}</Text></Pressable>)}</View><Text style={[styles.inputLabel, { color: text }]}>REMINDER TIME (OPTIONAL)</Text><TextInput value={taskTime} onChangeText={setTaskTime} placeholder="HH:MM — e.g. 18:30" placeholderTextColor={muted} keyboardType="numbers-and-punctuation" maxLength={5} style={[styles.modalInput, { color: text, backgroundColor: theme.background, borderColor: theme.border }]} /><Text style={[styles.smallText, { color: muted, marginTop: -4 }]}>Enter a future time today in 24-hour format. Expo Go reminders are disabled.</Text><Pressable onPress={() => void addTask()} style={styles.modalSubmit}><Text style={styles.modalSubmitText}>Create task</Text></Pressable></ScrollView> : <ScrollView keyboardShouldPersistTaps="handled"><Text style={[styles.inputLabel, { color: text }]}>SUBJECT NAME</Text><TextInput value={subjectName} onChangeText={setSubjectName} placeholder="e.g. ICT" placeholderTextColor={muted} style={[styles.modalInput, { color: text, backgroundColor: theme.background, borderColor: theme.border }]} /><Text style={[styles.inputLabel, { color: text }]}>CHOOSE A COLOR</Text><View style={styles.colorOptions}>{SUBJECT_COLORS.map((color) => <Pressable key={color} onPress={() => setSubjectColor(color)} style={[styles.colorOption, { backgroundColor: color, borderWidth: subjectColor === color ? 3 : 0, borderColor: text }]}>{subjectColor === color ? <Ionicons name="checkmark" size={17} color="#fff" /> : null}</Pressable>)}</View><Pressable onPress={() => void addSubject()} style={styles.modalSubmit}><Text style={styles.modalSubmitText}>Add subject</Text></Pressable></ScrollView>}</View></KeyboardAvoidingView></Modal>
+  </SafeAreaView>;
+}
+
+const styles = StyleSheet.create({
+  safeArea: { flex: 1 }, brandHeader: { flexDirection: "row", alignItems: "center", gap: 11, marginBottom: 22, paddingBottom: 14, borderBottomWidth: 1, borderBottomColor: "#ECEEF4" }, brandMark: { width: 42, height: 42, borderRadius: 14, backgroundColor: "#635BFF", alignItems: "center", justifyContent: "center" }, brandName: { fontSize: 20, fontWeight: "900", letterSpacing: -0.5 }, brandTagline: { fontSize: 10, marginTop: 2 }, brandAction: { width: 39, height: 39, borderRadius: 13, alignItems: "center", justifyContent: "center" }, loadingScreen: { flex: 1, alignItems: "center", justifyContent: "center", gap: 14 }, loadingText: { fontSize: 14, fontWeight: "600" }, pageContent: { paddingHorizontal: 20, paddingTop: 16 },
+  greetingRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 22 }, eyebrow: { fontSize: 10, fontWeight: "900", letterSpacing: 1.6, marginBottom: 7 }, pageTitle: { fontSize: 27, fontWeight: "900", letterSpacing: -0.8 }, subtitle: { fontSize: 13, marginTop: 5, lineHeight: 19 }, avatar: { height: 48, width: 48, borderRadius: 17, backgroundColor: "#EEEDFF", alignItems: "center", justifyContent: "center" }, card: { borderRadius: 23, padding: 17, marginBottom: 16, borderWidth: 1 },
+  heroCard: { backgroundColor: "#635BFF", borderColor: "#635BFF", padding: 20 }, heroTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, heroEyebrow: { color: "#D8D5FF", fontSize: 10, fontWeight: "800", letterSpacing: 1 }, heroNumber: { color: "#FFFFFF", fontSize: 36, fontWeight: "900", marginTop: 7 }, heroSub: { color: "#E2E0FF", fontSize: 11, marginTop: 4, maxWidth: 215, lineHeight: 16 }, heroIcon: { width: 50, height: 50, borderRadius: 17, backgroundColor: "rgba(255,255,255,0.19)", alignItems: "center", justifyContent: "center" }, heroDivider: { height: 1, backgroundColor: "rgba(255,255,255,0.22)", marginVertical: 19 }, heroBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 9 }, heroStatLabel: { color: "#D8D5FF", fontSize: 10 }, heroStatValue: { color: "#FFFFFF", fontSize: 19, fontWeight: "900", marginTop: 4 }, heroButton: { flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "#FFFFFF", paddingHorizontal: 12, paddingVertical: 11, borderRadius: 13 }, heroButtonText: { color: "#635BFF", fontWeight: "800", fontSize: 11 },
+  sectionTitle: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 10, marginBottom: 12 }, sectionHeading: { fontSize: 17, fontWeight: "900", letterSpacing: -0.3 }, actionText: { color: "#635BFF", fontSize: 12, fontWeight: "800" }, statsRow: { flexDirection: "row", gap: 12 }, statCard: { flex: 1, marginBottom: 16 }, statIcon: { width: 37, height: 37, borderRadius: 12, alignItems: "center", justifyContent: "center", marginBottom: 12 }, statValue: { fontSize: 23, fontWeight: "900" }, statLabel: { fontSize: 11, marginTop: 4 }, smallText: { fontSize: 11, lineHeight: 16 },
+  chartHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, chartTotal: { fontSize: 25, fontWeight: "900" }, weekControls: { flexDirection: "row", gap: 6 }, weekArrow: { width: 30, height: 30, borderRadius: 10, backgroundColor: "#F0F1F7", alignItems: "center", justifyContent: "center" }, chart: { flexDirection: "row", height: 168, marginTop: 17, gap: 6 }, chartColumn: { flex: 1, alignItems: "center" }, chartValue: { fontSize: 9, fontWeight: "800", height: 17 }, barTrack: { height: 118, width: "100%", justifyContent: "flex-end", alignItems: "center" }, chartBar: { width: "58%", minWidth: 12, maxWidth: 25, borderRadius: 8 }, chartLabel: { fontSize: 10, marginTop: 8 }, chartFootnote: { fontSize: 10, marginTop: 4 },
+  taskRow: { flexDirection: "row", alignItems: "center", paddingVertical: 12, borderBottomWidth: 1, gap: 9 }, checkCircle: { width: 21, height: 21, borderRadius: 7, borderWidth: 1.5, borderColor: "#D5D8E5", alignItems: "center", justifyContent: "center" }, checkedCircle: { backgroundColor: "#18A878", borderColor: "#18A878" }, taskTextWrap: { flex: 1 }, taskTitle: { fontSize: 12, fontWeight: "800" }, completedText: { textDecorationLine: "line-through", opacity: 0.55 }, taskMeta: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 5, flexWrap: "wrap" }, miniDot: { height: 6, width: 6, borderRadius: 3 }, priorityBadge: { paddingHorizontal: 7, paddingVertical: 5, borderRadius: 7 }, deleteButton: { padding: 5, marginLeft: 2 }, subjectGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 }, subjectTile: { width: "48%", flexGrow: 1, borderWidth: 1, borderRadius: 17, padding: 13, marginBottom: 4 }, subjectColorBar: { width: 25, height: 5, borderRadius: 3, marginBottom: 12 }, subjectTileName: { fontSize: 13, fontWeight: "900", marginBottom: 5 },
+  bottomNavPosition: { position: "absolute", left: 14, right: 14 }, bottomNav: { minHeight: 72, borderRadius: 25, borderWidth: 1, flexDirection: "row", justifyContent: "space-around", alignItems: "center", paddingHorizontal: 2, paddingVertical: 7, elevation: 12, shadowColor: "#17162B", shadowOffset: { width: 0, height: 5 }, shadowOpacity: 0.12, shadowRadius: 12 }, navItem: { flex: 1, alignItems: "center", justifyContent: "center", gap: 2 }, navIconWrap: { height: 32, minWidth: 36, borderRadius: 13, alignItems: "center", justifyContent: "center" }, navLabel: { fontSize: 9, fontWeight: "600" },
+  timerCard: { alignItems: "center", paddingVertical: 24, marginTop: 20 }, timerBadge: { flexDirection: "row", alignItems: "center", gap: 7, backgroundColor: "#EEEDFF", paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20 }, timerBadgeText: { fontSize: 9, color: "#635BFF", fontWeight: "900", letterSpacing: 1 }, timerCircleOuter: { height: 218, width: 218, borderRadius: 109, alignItems: "center", justifyContent: "center", marginVertical: 23 }, timerProgress: { ...StyleSheet.absoluteFillObject, borderRadius: 109, borderWidth: 8 }, timerCircleInner: { alignItems: "center", justifyContent: "center" }, timerTime: { fontSize: 43, fontWeight: "900", fontVariant: ["tabular-nums"], letterSpacing: -1.5 }, timerStatus: { fontSize: 12, marginTop: 8 }, timerLabel: { fontSize: 10, fontWeight: "900", letterSpacing: 1.1, alignSelf: "flex-start", marginBottom: 11, marginTop: 4 }, chipScroll: { gap: 8, paddingBottom: 15 }, subjectChip: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 13, paddingVertical: 10 }, durationRow: { flexDirection: "row", gap: 9, width: "100%" }, durationChip: { flex: 1, borderWidth: 1, borderRadius: 12, paddingVertical: 13, alignItems: "center" }, customDurationRow: { flexDirection: "row", gap: 8, width: "100%", marginTop: 10 }, customDurationInput: { flex: 1, borderWidth: 1, borderRadius: 12, paddingHorizontal: 13, height: 44, fontSize: 13 }, applyButton: { backgroundColor: "#635BFF", borderRadius: 12, paddingHorizontal: 20, alignItems: "center", justifyContent: "center" }, applyButtonText: { color: "#fff", fontWeight: "800", fontSize: 12 }, timerActions: { flexDirection: "row", gap: 10, width: "100%", marginTop: 19 }, startButton: { flex: 1, height: 53, borderRadius: 16, backgroundColor: "#635BFF", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 }, startButtonText: { color: "#fff", fontSize: 13, fontWeight: "900" }, resetButton: { height: 53, width: 53, borderRadius: 16, alignItems: "center", justifyContent: "center" }, timerNote: { fontSize: 10, marginTop: 14, textAlign: "center" }, sessionRow: { flexDirection: "row", alignItems: "center", gap: 11, paddingVertical: 10, borderBottomWidth: 1 }, sessionIcon: { width: 40, height: 40, borderRadius: 13, alignItems: "center", justifyContent: "center" }, sessionDuration: { fontSize: 13, fontWeight: "900" },
+  plannerSummary: { backgroundColor: "#635BFF", borderColor: "#635BFF", flexDirection: "row", alignItems: "center" }, plannerSummaryTitle: { color: "#fff", fontSize: 17, fontWeight: "900" }, plannerSummarySubtitle: { color: "#E0DEFF", fontSize: 11, marginTop: 6 }, plannerProgressCircle: { height: 58, width: 58, borderRadius: 29, backgroundColor: "rgba(255,255,255,0.17)", borderWidth: 3, borderColor: "#D5D1FF", alignItems: "center", justifyContent: "center" }, plannerProgressText: { color: "#fff", fontWeight: "900", fontSize: 14 }, statLine: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 12, borderBottomWidth: 1 }, statLineLabel: { fontSize: 12 }, statLineValue: { fontSize: 14, fontWeight: "900" },
+  addSubjectButton: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: "#635BFF", borderRadius: 15, paddingVertical: 15, marginVertical: 20 }, addSubjectText: { color: "#fff", fontSize: 13, fontWeight: "900" }, subjectCard: { marginBottom: 12 }, subjectCardTop: { flexDirection: "row", alignItems: "center", gap: 12 }, subjectLargeIcon: { height: 48, width: 48, borderRadius: 15, alignItems: "center", justifyContent: "center" }, subjectCardName: { fontSize: 15, fontWeight: "900", marginBottom: 5 }, subjectProgressTrack: { height: 7, borderRadius: 5, overflow: "hidden", marginTop: 19 }, subjectProgressFill: { height: 7, borderRadius: 5 }, subjectCardBottom: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 11, gap: 8 },
+  profileCard: { flexDirection: "row", alignItems: "center", gap: 13, marginTop: 22 }, profileIcon: { width: 54, height: 54, borderRadius: 17, backgroundColor: "#635BFF", alignItems: "center", justifyContent: "center" }, profileName: { fontSize: 17, fontWeight: "900", marginBottom: 5 }, versionBadge: { backgroundColor: "#E3F8EF", paddingHorizontal: 9, paddingVertical: 6, borderRadius: 9 }, versionText: { color: "#18A878", fontSize: 10, fontWeight: "900" }, settingsHeading: { fontSize: 10, fontWeight: "900", letterSpacing: 1.4, marginTop: 12, marginBottom: 10, marginLeft: 3 }, settingRow: { flexDirection: "row", alignItems: "center", gap: 11, paddingVertical: 12 }, settingIcon: { width: 39, height: 39, borderRadius: 12, alignItems: "center", justifyContent: "center" }, settingTitle: { fontSize: 12, fontWeight: "800", marginBottom: 4 },
+  emptyState: { alignItems: "center", justifyContent: "center", paddingVertical: 25, paddingHorizontal: 12 }, emptyIcon: { height: 48, width: 48, borderRadius: 16, backgroundColor: "#EEEDFF", alignItems: "center", justifyContent: "center", marginBottom: 12 }, emptyTitle: { fontSize: 14, fontWeight: "900", textAlign: "center" }, emptySubtitle: { fontSize: 11, textAlign: "center", marginTop: 6, lineHeight: 17 }, modalOverlay: { flex: 1, justifyContent: "flex-end" }, modalBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(12,16,32,0.48)" }, modalSheet: { maxHeight: "88%", borderTopLeftRadius: 27, borderTopRightRadius: 27, paddingHorizontal: 22, paddingTop: 12 }, modalHandle: { height: 5, width: 43, borderRadius: 4, backgroundColor: "#D9DCE7", alignSelf: "center", marginBottom: 18 }, modalTitleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }, modalTitle: { fontSize: 21, fontWeight: "900" }, inputLabel: { fontSize: 10, fontWeight: "900", letterSpacing: 1.1, marginBottom: 9, marginTop: 13 }, modalInput: { borderWidth: 1, borderRadius: 13, paddingHorizontal: 14, height: 49, fontSize: 13, marginBottom: 8 }, priorityOptions: { flexDirection: "row", gap: 9, marginBottom: 8 }, priorityOption: { flex: 1, borderWidth: 1, borderRadius: 12, paddingVertical: 12, alignItems: "center" }, modalSubmit: { height: 52, borderRadius: 15, backgroundColor: "#635BFF", alignItems: "center", justifyContent: "center", marginTop: 10, marginBottom: 15 }, modalSubmitText: { color: "#fff", fontSize: 14, fontWeight: "900" }, colorOptions: { flexDirection: "row", gap: 13, marginVertical: 10 }, colorOption: { height: 36, width: 36, borderRadius: 13, alignItems: "center", justifyContent: "center" },
+});
